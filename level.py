@@ -2,19 +2,17 @@ import os
 import pygame
 import random
 
-# Tweakables za veličinu itema
-LEMON_PAD_VISUAL = 2          # koliko piksela margine ostaviti oko limuna (vizuelno)
-LEMON_PAD_COLLISION = 2       # koliko manji da bude collision box (prijatniji pickup)
+LEMON_PAD_VISUAL = 2
+LEMON_PAD_COLLISION = 2
 
-def _load_sprite(name: str, size) -> pygame.Surface | None:
-    """Load assets/<name>.(png|jpg|jpeg|webp|bmp), scaled to size."""
+def _load_sprite(name: str, size):
     base = os.path.dirname(os.path.abspath(__file__))
     assets = os.path.join(base, "assets")
     if not os.path.isdir(assets):
         return None
     for fname in os.listdir(assets):
         root, ext = os.path.splitext(fname)
-        if root.lower() == name.lower() and ext.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        if root.lower() == name.lower() and ext.lower() in (".png",".jpg",".jpeg",".webp",".bmp"):
             path = os.path.join(assets, fname)
             try:
                 img = pygame.image.load(path)
@@ -27,39 +25,32 @@ def _load_sprite(name: str, size) -> pygame.Surface | None:
 class Level:
     """
     Tiles:
-      0 = floor, 1 = wall, 2 = lemon (score), 3 = lava (forbidden), 4 = finish (green tile)
-    20x15 grid with outer walls, scattered lava & lemons.
+      0=floor, 1=wall, 2=lemon, 3=lava, 4=finish(green)
     """
 
     def __init__(self, tile_size=32, seed=None):
         self.TILE = tile_size
         self.cols, self.rows = 20, 15
+        if seed is not None: random.seed(seed)
 
-        if seed is not None:
-            random.seed(seed)
-
-        # Start/finish tiles (grid positions)
         self.start_tile  = (2, 2)
         self.finish_tile = (self.cols - 2, 2)
 
-        # Map: walls around, floor inside
+        # Base map: walls around
         self.map_data = [[1]*self.cols]
         for _ in range(self.rows - 2):
             self.map_data.append([1] + [0]*(self.cols - 2) + [1])
         self.map_data.append([1]*self.cols)
 
-        # Scatter lava & lemons
+        # Scatter
         for y in range(1, self.rows - 1):
             for x in range(1, self.cols - 1):
-                if (x, y) in (self.start_tile, self.finish_tile):
-                    continue
+                if (x, y) in (self.start_tile, self.finish_tile): continue
                 r = random.random()
-                if r < 0.08:
-                    self.map_data[y][x] = 3  # lava
-                elif r < 0.13:
-                    self.map_data[y][x] = 2  # lemon
+                if r < 0.08:   self.map_data[y][x] = 3  # lava
+                elif r < 0.13: self.map_data[y][x] = 2  # lemon
 
-        # Put finish and clear danger around start/finish
+        # Finish and safety rings
         sx, sy = self.start_tile
         fx, fy = self.finish_tile
         self.map_data[fy][fx] = 4
@@ -71,49 +62,46 @@ class Level:
                         if self.map_data[ty][tx] == 3:
                             self.map_data[ty][tx] = 0
 
-        # Start position in pixels
         self.start_x = self.TILE * self.start_tile[0]
         self.start_y = self.TILE * self.start_tile[1]
 
-        # Fallback colors
         self.colors = {
-            0: (50, 50, 50),      # floor
-            1: (100, 100, 100),   # wall
-            2: (230, 200, 40),    # lemon
-            3: (170, 40, 40),     # lava
-            4: (60, 200, 80),     # finish GREEN (traženo)
+            0:(50,50,50), 1:(100,100,100), 2:(230,200,40), 3:(170,40,40), 4:(60,200,80)
         }
 
-        # Load sprites (None -> fallback)
         ts = (self.TILE, self.TILE)
         self.tex_floor  = _load_sprite("tile_floor", ts)
         self.tex_wall   = _load_sprite("tile_wall", ts)
-        self.tex_lava   = _load_sprite("tile_lava", ts)
 
-        # Forsiramo “finish” kao zelenu pločicu — ne koristimo finish.png više
+        # Lava: try two frames first, else fallback to single
+        self.tex_lava0  = _load_sprite("tile_lava_0", ts)
+        self.tex_lava1  = _load_sprite("tile_lava_1", ts)
+        if not (self.tex_lava0 and self.tex_lava1):
+            self.tex_lava0 = self.tex_lava0 or _load_sprite("tile_lava", ts)
+            self.tex_lava1 = self.tex_lava1 or self.tex_lava0
+
         self.tex_finish = None
-
-        # Veći limun: skoro pun tile (ostavimo tanak border)
-        lemon_size = (self.TILE - 2*LEMON_PAD_VISUAL, self.TILE - 2*LEMON_PAD_VISUAL)
+        lemon_size = (self.TILE-2*LEMON_PAD_VISUAL, self.TILE-2*LEMON_PAD_VISUAL)
         self.tex_lemon  = _load_sprite("item_lemon", lemon_size)
 
-        # Items tracked separately (so we can remove on pickup and respawn on reset)
         self.initial_items = self._extract_items()
         self.items = list(self.initial_items)
 
-    # ---- Drawing & collisions ----
     def draw(self, screen):
+        t = pygame.time.get_ticks()
+        lava_frame = 0 if ((t // 180) % 2 == 0) else 1  # ~5.5 fps flicker
+
         for y, row in enumerate(self.map_data):
             for x, tile in enumerate(row):
                 dst = pygame.Rect(x*self.TILE, y*self.TILE, self.TILE, self.TILE)
 
-                # choose texture / color
                 if tile == 1:
                     tex, color = self.tex_wall, self.colors[1]
                 elif tile == 3:
-                    tex, color = self.tex_lava, self.colors[3]
+                    tex = self.tex_lava0 if lava_frame == 0 else self.tex_lava1
+                    color = self.colors[3]
                 elif tile == 4:
-                    tex, color = self.tex_finish, self.colors[4]  # tex_finish je None -> crtajmo zeleno
+                    tex, color = self.tex_finish, self.colors[4]
                 else:
                     tex, color = self.tex_floor, self.colors[0]
 
@@ -122,11 +110,10 @@ class Level:
                 else:
                     pygame.draw.rect(screen, color, dst)
 
-        # lemons (centered; sada veliki)
+        # lemons
         for (ix, iy) in self.items:
             if self.tex_lemon is not None:
-                pos = (ix*self.TILE + LEMON_PAD_VISUAL,
-                       iy*self.TILE + LEMON_PAD_VISUAL)
+                pos = (ix*self.TILE + LEMON_PAD_VISUAL, iy*self.TILE + LEMON_PAD_VISUAL)
                 screen.blit(self.tex_lemon, pos)
             else:
                 rect = pygame.Rect(ix*self.TILE+LEMON_PAD_VISUAL, iy*self.TILE+LEMON_PAD_VISUAL,
@@ -141,7 +128,6 @@ class Level:
                         return True
         return False
 
-    # ---- Interactions ----
     def _extract_items(self):
         return [(x, y) for y, row in enumerate(self.map_data) for x, t in enumerate(row) if t == 2]
 
@@ -150,7 +136,6 @@ class Level:
 
     def check_pickup(self, rect: pygame.Rect) -> bool:
         hit = None
-        # Collision box malo manji od celog tile-a da je “prijatniji”
         for (ix, iy) in self.items:
             item_rect = pygame.Rect(ix*self.TILE+LEMON_PAD_COLLISION,
                                     iy*self.TILE+LEMON_PAD_COLLISION,
@@ -159,8 +144,7 @@ class Level:
             if rect.colliderect(item_rect):
                 hit = (ix, iy); break
         if hit:
-            self.items.remove(hit)
-            return True
+            self.items.remove(hit); return True
         return False
 
     def tile_at_pixel_center(self, rect: pygame.Rect) -> int:
@@ -168,7 +152,7 @@ class Level:
         cy = rect.centery // self.TILE
         if 0 <= cy < self.rows and 0 <= cx < self.cols:
             return self.map_data[cy][cx]
-        return 1  # out of bounds -> wall
+        return 1
 
     def is_on_red(self, rect: pygame.Rect) -> bool:
         return self.tile_at_pixel_center(rect) == 3

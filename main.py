@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import random
 import pygame
 from player import Player
 from rules import Rules
@@ -11,17 +12,28 @@ from enemy import Enemy
 WIDTH, HEIGHT = 640, 480
 TILE = 32
 PLAYER_SPEED = 2
-ENEMY_SPEED  = 2
+ENEMY_SPEED  = 2            # base speed; will ramp up with score
 IDLE_LIMIT_FRAMES = 120
 MAX_LIVES = 3
 
 SCORES_FILE = "scores.json"
 MAX_SCORES = 5
 
+# Effect timings
+FLASH_MAX_FRAMES  = 14      # red flash duration
+SHAKE_MAX_FRAMES  = 12      # screen shake duration
+SHAKE_MAX_AMPL    = 4       # max px of shake at start
+
 # ---------------- Pygame init ----------------
 pygame.init()
+AUDIO_OK = True
+try:
+    pygame.mixer.init()
+except Exception:
+    AUDIO_OK = False
+
 SCREEN = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Three Forbidden Rules")
+pygame.display.set_caption("Three Forbidden Acts")
 CLOCK = pygame.time.Clock()
 FONT     = pygame.font.Font(None, 28)
 FONT_BIG = pygame.font.Font(None, 40)
@@ -31,12 +43,13 @@ COLOR_UI_DIM     = (90, 140, 220)
 COLOR_UI         = (120, 180, 255)
 COLOR_UI_BRIGHT  = (160, 210, 255)
 COLOR_WARN       = (255, 120, 120)
+COLOR_PANEL      = (0, 0, 0, 160)
 
 # ---------------- Assets ----------------
 def load_menu_bg(width, height):
     base = os.path.dirname(os.path.abspath(__file__))
     assets_dir = os.path.join(base, "assets")
-    allowed_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     if not os.path.isdir(assets_dir):
         print(f"[Menu BG] assets not found: {assets_dir}")
         return None
@@ -48,8 +61,9 @@ def load_menu_bg(width, height):
     chosen = None
     for f in files:
         r, e = os.path.splitext(f)
-        if r.lower() == "menu_bg" and e.lower() in allowed_exts:
-            chosen = os.path.join(assets_dir, f); break
+        if r.lower() == "menu_bg" and e.lower() in exts:
+            chosen = os.path.join(assets_dir, f)
+            break
     if not chosen:
         print(f"[Menu BG] Put menu_bg.(png|jpg|jpeg|webp|bmp) into {assets_dir}")
         return None
@@ -62,6 +76,38 @@ def load_menu_bg(width, height):
         return None
 
 MENU_BG = load_menu_bg(WIDTH, HEIGHT)
+
+def load_sound(basename: str):
+    """Load assets/sfx_<basename>.(wav|ogg|mp3)."""
+    if not AUDIO_OK:
+        return None
+    base = os.path.dirname(os.path.abspath(__file__))
+    assets = os.path.join(base, "assets")
+    if not os.path.isdir(assets):
+        return None
+    for ext in (".wav", ".ogg", ".mp3"):
+        p = os.path.join(assets, f"sfx_{basename}{ext}")
+        if os.path.exists(p):
+            try:
+                snd = pygame.mixer.Sound(p)
+                snd.set_volume(0.6)
+                print(f"[SFX] Loaded {os.path.basename(p)}")
+                return snd
+            except Exception as e:
+                print(f"[SFX] Failed to load {p}: {e}")
+                return None
+    return None
+
+SFX = {
+    "pickup": load_sound("pickup"),
+    "break":  load_sound("break"),
+    "win":    load_sound("win"),
+}
+def play_sfx(key: str):
+    snd = SFX.get(key)
+    if snd:
+        try: snd.play()
+        except Exception: pass
 
 # ---------------- Scores ----------------
 def load_scores():
@@ -94,26 +140,53 @@ player_name = ""
 idle_frames = 0
 lives = MAX_LIVES
 won = False
+show_help = False
+
+# Two enemies container
+enemies = []
+
+# Effects state
+flash_frames = 0
+shake_frames = 0
+
+# ---------------- Difficulty ----------------
+def current_enemy_speed(score: int) -> float:
+    """Base speed plus +0.2 for every 5 points."""
+    return ENEMY_SPEED + 0.2 * (score // 5)
+
+def apply_enemy_speed():
+    spd = current_enemy_speed(rules.score)
+    for e in enemies:
+        e.speed = spd
 
 # ---------------- World lifecycle ----------------
 def start_new_run():
-    global level, player, rules, enemy, idle_frames, won, lives
+    global level, player, rules, enemies, idle_frames, won, lives, flash_frames, shake_frames
     level = Level(tile_size=TILE, seed=None)
-    rules = Rules()                # score = 0 on brand-new run
+    rules = Rules()  # score resets on brand-new run
     player = Player(level.start_x, level.start_y, speed=PLAYER_SPEED)
-    enemy  = Enemy(start_px_x=TILE*15, start_px_y=TILE*3, tile_size=TILE, speed=ENEMY_SPEED)
+    enemies = [
+        Enemy(start_px_x=TILE*15, start_px_y=TILE*3,  tile_size=TILE, speed=current_enemy_speed(0)),
+        Enemy(start_px_x=TILE*4,  start_px_y=TILE*11, tile_size=TILE, speed=current_enemy_speed(0)),
+    ]
     idle_frames = 0
     lives = MAX_LIVES
     won = False
+    flash_frames = 0
+    shake_frames = 0
 
 def reset_after_break():
-    global enemy, idle_frames, state, lives
+    """Lose a heart; soft-reset world if hearts remain, else Game Over."""
+    global enemies, idle_frames, state, lives, flash_frames, shake_frames
     lives -= 1
     if lives > 0:
-        rules.reset_run_state()    # keeps score
+        rules.reset_run_state()           # keep score
         level.reset_run_state()
         player.reset_position(level.start_x, level.start_y)
-        enemy = Enemy(start_px_x=TILE*15, start_px_y=TILE*3, tile_size=TILE, speed=ENEMY_SPEED)
+        enemies = [
+            Enemy(start_px_x=TILE*15, start_px_y=TILE*3,  tile_size=TILE, speed=current_enemy_speed(rules.score)),
+            Enemy(start_px_x=TILE*4,  start_px_y=TILE*11, tile_size=TILE, speed=current_enemy_speed(rules.score)),
+        ]
         idle_frames = 0
     else:
         save_score(player_name or "Player", rules.score)
@@ -144,13 +217,63 @@ def draw_hud():
     text = FONT.render(info, True, COLOR_UI)
     pad = 6
     bg = pygame.Surface((text.get_width()+pad*2, text.get_height()+pad*2), pygame.SRCALPHA)
-    bg.fill((0,0,0,140))
+    bg.fill(COLOR_PANEL)
     SCREEN.blit(bg, (8, 8))
     SCREEN.blit(text, (8+pad, 8+pad))
     draw_hearts()
     if rules.last_broken_msg:
         warn = FONT.render(rules.last_broken_msg, True, COLOR_WARN)
         SCREEN.blit(warn, (8, 8 + bg.get_height() + 6))
+
+def draw_help_overlay():
+    panel = pygame.Surface((WIDTH-80, HEIGHT-120), pygame.SRCALPHA)
+    panel.fill((0,0,0,200))
+    x = 40; y = 60
+    SCREEN.blit(panel, (x, y))
+    yy = y + 20
+    draw_text_center(SCREEN, "How to Play — Three Forbidden Acts", yy, FONT_BIG, COLOR_UI_BRIGHT)
+    yy += 50
+    lines = [
+        "Goal: Reach the green FINISH tile. Collect lemons for points.",
+        "",
+        "Rules (break one => lose a heart):",
+        "  1) Do NOT step on lava (red tiles).",
+        "  2) Do NOT get caught by the monsters.",
+        "  3) Do NOT stand still for ~2 seconds.",
+        "",
+        "Controls:",
+        "  Arrow Keys — Move (no diagonals).",
+        "  H or F1 — Toggle this help overlay.",
+        "  ESC — Back to menu (in some screens).",
+    ]
+    for line in lines:
+        t = FONT.render(line, True, COLOR_UI)
+        SCREEN.blit(t, (x + 30, yy)); yy += 28
+    hint = "Press H or F1 to hide"
+    t = FONT.render(hint, True, COLOR_UI_DIM)
+    SCREEN.blit(t, (WIDTH//2 - t.get_width()//2, y + panel.get_height() - 30))
+
+def apply_flash_and_shake(base_surface):
+    """Blit base_surface to SCREEN with shake, then red flash overlay."""
+    global shake_frames, flash_frames
+    # --- Shake ---
+    if shake_frames > 0:
+        strength = SHAKE_MAX_AMPL * (shake_frames / SHAKE_MAX_FRAMES)
+        ox = int(random.uniform(-strength, strength))
+        oy = int(random.uniform(-strength, strength))
+        SCREEN.fill((0,0,0))
+        SCREEN.blit(base_surface, (ox, oy))
+        shake_frames -= 1
+    else:
+        SCREEN.blit(base_surface, (0,0))
+
+    # --- Flash (red screen) ---
+    if flash_frames > 0:
+        alpha = int(180 * (flash_frames / FLASH_MAX_FRAMES))
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((255, 40, 40, alpha))
+        SCREEN.blit(overlay, (0,0))
+        flash_frames -= 1
 
 # ---------------- Main loop ----------------
 running = True
@@ -159,9 +282,15 @@ while running:
         if event.type == pygame.QUIT:
             running = False
 
+        # Global help toggle
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_h, pygame.K_F1):
+            show_help = not show_help
+
         if state == STATE_MENU and event.type == pygame.KEYDOWN:
-            if event.key in (pygame.K_UP, pygame.K_w):   menu_index = (menu_index - 1) % len(menu_items)
-            elif event.key in (pygame.K_DOWN, pygame.K_s): menu_index = (menu_index + 1) % len(menu_items)
+            if event.key in (pygame.K_UP, pygame.K_w):
+                menu_index = (menu_index - 1) % len(menu_items)
+            elif event.key in (pygame.K_DOWN, pygame.K_s):
+                menu_index = (menu_index + 1) % len(menu_items)
             elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                 choice = menu_items[menu_index]
                 if choice == "Start Game":
@@ -201,6 +330,8 @@ while running:
         for i, item in enumerate(menu_items):
             color = COLOR_UI_BRIGHT if i == menu_index else COLOR_UI_DIM
             draw_text_center(SCREEN, item, 170 + i*40, FONT, color)
+        if show_help:
+            draw_help_overlay()
 
     elif state == STATE_NAME:
         SCREEN.fill((0,0,0))
@@ -211,8 +342,10 @@ while running:
         pygame.draw.rect(SCREEN, (120,120,120), box, width=2, border_radius=6)
         name_surf = FONT.render(player_name or "_", True, COLOR_UI)
         SCREEN.blit(name_surf, (box.x + 10, box.y + 8))
-        hint = FONT.render("Press ENTER to start", True, COLOR_UI_DIM)
+        hint = FONT.render("Press ENTER to start   ·   H / F1 — Help", True, COLOR_UI_DIM)
         SCREEN.blit(hint, (WIDTH//2 - hint.get_width()//2, 260))
+        if show_help:
+            draw_help_overlay()
 
     elif state == STATE_SCORES:
         SCREEN.fill((0,0,0))
@@ -226,55 +359,83 @@ while running:
                 line = f"{i:2}. {s['name']:<20}  {s['score']} pts"
                 t = FONT.render(line, True, COLOR_UI)
                 SCREEN.blit(t, (WIDTH//2 - 200, y)); y += 30
-        draw_text_center(SCREEN, "Press ESC to return", 420, FONT, COLOR_UI_DIM)
+        draw_text_center(SCREEN, "Press ESC to return   ·   H / F1 — Help", 420, FONT, COLOR_UI_DIM)
+        if show_help:
+            draw_help_overlay()
 
     elif state == STATE_PLAY:
-        SCREEN.fill((0,0,0))
-        keys = pygame.key.get_pressed()
+        # Draw world to offscreen then apply shake/flash
+        GAME_SURF = pygame.Surface((WIDTH, HEIGHT))
 
-        # Update entities
+        keys = pygame.key.get_pressed()
+        prev_score = rules.score
+
         player.update(keys, rules, level)
-        enemy.update(level, player.rect)
+        for e in enemies:
+            e.update(level, player.rect)
 
         # Rule 1: lava
         if level.is_on_red(player.rect):
             rules.break_rule(1, "Stepped on a lava tile.")
 
-        # Rule 2: monster caught you
-        if enemy.rect.colliderect(player.rect):
-            rules.break_rule(2, "Caught by the Sentinel.")
+        # Rule 2: any monster hits
+        if any(e.rect.colliderect(player.rect) for e in enemies):
+            rules.break_rule(2, "Caught by a Sentinel.")
 
         # Rule 3: no camping
         idle_frames = 0 if getattr(player, "moved_this_frame", False) else idle_frames + 1
         if idle_frames > IDLE_LIMIT_FRAMES:
             rules.break_rule(3, "Stayed still for too long.")
 
-        # Handle penalties / lives
+        # Pickup SFX + difficulty ramp
+        if rules.score > prev_score:
+            play_sfx("pickup")
+            apply_enemy_speed()  # update speeds when score grows
+
+        # Handle penalties / lives -> trigger effects
         if rules.any_broken():
+            play_sfx("break")
+            # Start effects; they will be drawn after soft reset
+            flash_frames = FLASH_MAX_FRAMES
+            shake_frames = SHAKE_MAX_FRAMES
             reset_after_break()
 
         # Win condition
         if state == STATE_PLAY and level.touches_exit(player.rect):
+            play_sfx("win")
             save_score(player_name or "Player", rules.score)
             state = STATE_WIN
 
-        # Draw world + HUD
-        level.draw(SCREEN)
-        enemy.draw(SCREEN)
-        player.draw(SCREEN)
+        # Draw world onto GAME_SURF
+        GAME_SURF.fill((0,0,0))
+        level.draw(GAME_SURF)
+        for e in enemies:
+            e.draw(GAME_SURF)
+        player.draw(GAME_SURF)
+
+        # Present with effects to SCREEN
+        apply_flash_and_shake(GAME_SURF)
+
+        # HUD and help overlay on top (not affected by shake)
         draw_hud()
+        if show_help:
+            draw_help_overlay()
 
     elif state == STATE_WIN:
         SCREEN.fill((0,0,0))
         draw_text_center(SCREEN, "YOU WIN!", 150, FONT_BIG, COLOR_UI_BRIGHT)
         draw_text_center(SCREEN, f"Score saved for {player_name or 'Player'}: {rules.score} pts", 200, FONT, COLOR_UI)
         draw_text_center(SCREEN, "Press ENTER to return to menu", 260, FONT, COLOR_UI_DIM)
+        if show_help:
+            draw_help_overlay()
 
     elif state == STATE_GAMEOVER:
         SCREEN.fill((0,0,0))
         draw_text_center(SCREEN, "GAME OVER", 150, FONT_BIG, COLOR_UI_BRIGHT)
         draw_text_center(SCREEN, f"Score saved for {player_name or 'Player'}: {rules.score} pts", 200, FONT, COLOR_UI)
         draw_text_center(SCREEN, "Press ENTER to return to menu", 260, FONT, COLOR_UI_DIM)
+        if show_help:
+            draw_help_overlay()
 
     pygame.display.flip()
     CLOCK.tick(60)
